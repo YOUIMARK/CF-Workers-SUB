@@ -196,18 +196,19 @@ async function proxyURL(proxyUrlList, url) {
 }
 
 async function getUrl(request, targetUrl, appendUA, userAgentHeader, signal) {
-  const newHeaders = new Headers(request.headers);
+  // 不复用原始请求头：避免把 CF-Connecting-IP / CF-Ray / Host 等 Cloudflare
+  // 内部头转发给上游，导致上游（同样套了 CF 的服务器）返回 403
+  const newHeaders = new Headers();
   newHeaders.set('User-Agent', `${atob('djJyYXlOLzYuNDU=')} cmliu/CF-Workers-SUB ${appendUA}(${userAgentHeader})`);
 
   const modifiedRequest = new Request(targetUrl, {
-    method: request.method,
+    method: 'GET',
     headers: newHeaders,
-    body: request.method === 'GET' ? null : request.body,
     redirect: 'follow',
   });
 
   console.log(`请求URL: ${targetUrl}`);
-  console.log(`请求方法: ${request.method}`);
+  console.log(`请求方法: GET`);
 
   return fetch(modifiedRequest, { signal });
 }
