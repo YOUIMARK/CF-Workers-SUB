@@ -213,7 +213,8 @@ async function getUrl(request, targetUrl, appendUA, userAgentHeader, signal) {
 }
 
 async function getSub(api, request, appendUA, userAgentHeader) {
-  if (!api || api.length === 0) return [[], ''];
+  const debugLog = [];
+  if (!api || api.length === 0) return [[], '', debugLog];
 
   const uniqueApi = [...new Set(api)];
   let newapi = '';
@@ -225,48 +226,58 @@ async function getSub(api, request, appendUA, userAgentHeader) {
 
   try {
     const responses = await Promise.allSettled(
-      uniqueApi.map(apiUrl =>
-        getUrl(request, apiUrl, appendUA, userAgentHeader, controller.signal)
-          .then(response => response.ok ? response.text() : Promise.reject(response))
-      )
+      uniqueApi.map(apiUrl => {
+        const startMs = Date.now();
+        return getUrl(request, apiUrl, appendUA, userAgentHeader, controller.signal)
+          .then(response => {
+            const elapsed = Date.now() - startMs;
+            if (response.ok) {
+              return response.text().then(body => ({ ok: true, status: response.status, body, elapsed, apiUrl }));
+            }
+            return { ok: false, status: response.status, body: '', elapsed, apiUrl };
+          })
+          .catch(err => ({ ok: false, status: err?.status || 0, body: '', elapsed: Date.now() - startMs, apiUrl, error: err?.name || String(err) }));
+      })
     );
 
-    const modifiedResponses = responses.map((response, index) => {
-      if (response.status === 'rejected') {
-        const reason = response.reason;
-        if (reason && reason.name === 'AbortError') {
-          return { status: '超时', value: null, apiUrl: uniqueApi[index] };
-        }
-        console.error(`请求失败: ${uniqueApi[index]}, 错误: ${reason?.status} ${reason?.statusText}`);
-        return { status: '请求失败', value: null, apiUrl: uniqueApi[index] };
-      }
-      return { status: response.status, value: response.value, apiUrl: uniqueApi[index] };
-    });
+    for (const result of responses) {
+      const r = result.status === 'fulfilled' ? result.value : { ok: false, status: 0, body: '', elapsed: 0, apiUrl: uniqueApi[responses.indexOf(result)], error: 'promise rejected' };
 
-    for (const response of modifiedResponses) {
-      if (response.status !== 'fulfilled') continue;
-      const content = response.value || '';
+      if (!r.ok) {
+        debugLog.push({ url: r.apiUrl, status: r.status, elapsed: r.elapsed + 'ms', result: r.error || `HTTP ${r.status}` });
+        continue;
+      }
+
+      const content = r.body || '';
       if (content.includes('proxies:')) {
-        subConverterUrls += '|' + response.apiUrl;
+        debugLog.push({ url: r.apiUrl, status: r.status, elapsed: r.elapsed + 'ms', result: 'clash订阅 → 交由转换后端' });
+        subConverterUrls += '|' + r.apiUrl;
       } else if (content.includes('outbounds"') && content.includes('inbounds"')) {
-        subConverterUrls += '|' + response.apiUrl;
+        debugLog.push({ url: r.apiUrl, status: r.status, elapsed: r.elapsed + 'ms', result: 'singbox订阅 → 交由转换后端' });
+        subConverterUrls += '|' + r.apiUrl;
       } else if (content.includes('://')) {
+        const lines = content.split('\n').filter(l => l.trim()).length;
+        debugLog.push({ url: r.apiUrl, status: r.status, elapsed: r.elapsed + 'ms', result: `明文节点 (${lines} 条)` });
         newapi += content + '\n';
       } else if (isValidBase64(content)) {
-        newapi += base64Decode(content) + '\n';
+        const decoded = base64Decode(content);
+        const lines = decoded.split('\n').filter(l => l.trim()).length;
+        debugLog.push({ url: r.apiUrl, status: r.status, elapsed: r.elapsed + 'ms', result: `base64解码 (${lines} 条)` });
+        newapi += decoded + '\n';
       } else {
-        const host = (response.apiUrl.split('://')[1] || response.apiUrl).split('/')[0];
+        debugLog.push({ url: r.apiUrl, status: r.status, elapsed: r.elapsed + 'ms', result: `未识别格式 (前100字: ${content.slice(0, 100)})` });
+        const host = (r.apiUrl.split('://')[1] || r.apiUrl).split('/')[0];
         abnormalSubs += `trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#${encodeURIComponent('异常订阅 ' + host)}\n`;
       }
     }
   } catch (error) {
-    console.error(error);
+    debugLog.push({ error: String(error) });
   } finally {
     clearTimeout(timeout);
   }
 
   const subContent = await splitLines(newapi + abnormalSubs);
-  return [subContent, subConverterUrls];
+  return [subContent, subConverterUrls, debugLog];
 }
 
 async function migrateAddressList(env, txt = 'ADD.txt') {
@@ -729,12 +740,23 @@ export default {
     // ---- 7. 拉取上游订阅 ----
     const uniqueSubUrls = [...new Set(subUrls)].filter(item => item.trim());
     if (uniqueSubUrls.length > 0) {
-      const subResponseContent = await getSub(uniqueSubUrls, request, appendUA, userAgentHeader);
-      reqData += subResponseContent[0].join('\n');
-      subConverterURL += '|' + subResponseContent[1];
+      const [subNodes, subConverterUrlsRaw, debugLog] = await getSub(uniqueSubUrls, request, appendUA, userAgentHeader);
 
-      if (subFormat === 'base64' && !isSubConverterRequest && subResponseContent[1].includes('://')) {
-        subConverterUrl = `${effectiveSubProtocol}://${effectiveSubConverter}/sub?target=mixed&url=${encodeURIComponent(subResponseContent[1])}&insert=false&config=${encodeURIComponent(effectiveSubConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
+      // 调试模式：在订阅地址后加 &debug=1 查看上游拉取详情
+      if (url.searchParams.has('debug')) {
+        return new Response(JSON.stringify({
+          debug: debugLog,
+          totalUrls: uniqueSubUrls.length,
+          successCount: debugLog.filter(d => d.result && !d.result.startsWith('未识别') && !d.result.startsWith('HTTP') && !d.error).length,
+          failCount: debugLog.filter(d => d.result?.startsWith('HTTP') || d.error).length,
+        }, null, 2), { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+      }
+
+      reqData += subNodes.join('\n');
+      subConverterURL += '|' + subConverterUrlsRaw;
+
+      if (subFormat === 'base64' && !isSubConverterRequest && subConverterUrlsRaw.includes('://')) {
+        subConverterUrl = `${effectiveSubProtocol}://${effectiveSubConverter}/sub?target=mixed&url=${encodeURIComponent(subConverterUrlsRaw)}&insert=false&config=${encodeURIComponent(effectiveSubConfig)}&emoji=true&list=false&tfo=false&scv=true&fdn=false&sort=false&new_name=true`;
         try {
           const subConverterResponse = await fetch(subConverterUrl, {
             headers: { 'User-Agent': 'v2rayN/CF-Workers-SUB  (https://github.com/cmliu/CF-Workers-SUB)' }
